@@ -8,12 +8,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import re
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 from prs_connector_core import (
     BaseConnector,
@@ -24,6 +28,7 @@ from prs_connector_core import (
 )
 
 DISCOVERY_ACTION = "prsConnector.zigbee2mqtt.device_discovered"
+DISCOVERY_CREATED_ACTION = "prsConnector.zigbee2mqtt.device_created"
 DEFAULT_BASE_TOPIC = "zigbee2mqtt"
 READ_ACCESS_BIT = 1
 
@@ -198,6 +203,16 @@ class Zigbee2MqttConnector(BaseConnector):
     def _auto_create_enabled(self) -> bool:
         return _config_bool(self._auto_create_config().get("enabled"), default=False)
 
+    def _auto_create_mode(self) -> str:
+        auto_cfg = self._auto_create_config()
+        mode = str(auto_cfg.get("mode") or auto_cfg.get("transport") or "").strip().lower()
+        if not mode and (auto_cfg.get("apiUrl") or auto_cfg.get("api_url") or auto_cfg.get("platformUrl")):
+            return "rest"
+        return mode or "event"
+
+    def _auto_create_uses_rest(self) -> bool:
+        return self._auto_create_mode() in {"rest", "http", "api"}
+
     def _build_topic_to_tags(self) -> dict[str, list[str]]:
         """Актуальный маппинг MQTT topic -> список tag_id из конфигурации тегов."""
         mapping: defaultdict[str, list[str]] = defaultdict(list)
@@ -339,8 +354,15 @@ class Zigbee2MqttConnector(BaseConnector):
         if self._discovery_fingerprints.get(device_key) == fingerprint:
             return
 
-        self._discovery_fingerprints[device_key] = fingerprint
-        await self._publish_discovery_payload(payload)
+        if self._auto_create_uses_rest():
+            created = await self._create_model_via_rest(payload)
+            if created:
+                self._discovery_fingerprints[device_key] = fingerprint
+            return
+
+        published = await self._publish_connector_event(payload)
+        if published:
+            self._discovery_fingerprints[device_key] = fingerprint
 
     def _device_features(self, device: dict[str, Any]) -> list[dict[str, Any]]:
         definition = _as_dict(device.get("definition"))
@@ -507,10 +529,10 @@ class Zigbee2MqttConnector(BaseConnector):
         value = device.get("ieee_address") or device.get("ieeeAddress") or device.get("ieeeAddr")
         return str(value) if value else None
 
-    async def _publish_discovery_payload(self, payload: dict[str, Any]) -> None:
+    async def _publish_connector_event(self, payload: dict[str, Any]) -> bool:
         if not self._mqtt_client or not self._mqtt_connected.is_set():
             self._logger.debug("Discovery Zigbee2MQTT подготовлен, но связь с платформой ещё не установлена.")
-            return
+            return False
 
         try:
             await self._mqtt_client.publish(
@@ -523,8 +545,119 @@ class Zigbee2MqttConnector(BaseConnector):
                 "Отправлено discovery-событие Zigbee2MQTT для устройства %s.",
                 device.get("friendlyName") or device.get("id"),
             )
+            return True
         except Exception as ex:
             self._logger.error("Не удалось отправить discovery-событие Zigbee2MQTT: %s", ex)
+            return False
+
+    async def _create_model_via_rest(self, payload: dict[str, Any]) -> bool:
+        try:
+            result = await asyncio.to_thread(self._create_model_via_rest_sync, payload)
+        except Exception as ex:
+            self._logger.error("Не удалось создать модель Zigbee2MQTT через REST API: %s", ex)
+            if _config_bool(self._auto_create_config().get("fallbackToEvent"), default=False):
+                return await self._publish_connector_event(payload)
+            return False
+
+        created_payload = {
+            "action": DISCOVERY_CREATED_ACTION,
+            "data": {
+                **payload["data"],
+                "result": result,
+            },
+        }
+        await self._publish_connector_event(created_payload)
+        return True
+
+    def _create_model_via_rest_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        model = payload["data"]["model"]
+        object_body = copy.deepcopy(model["object"])
+        object_res = self._api_request("POST", "/objects/", object_body)
+        object_id = self._response_id(object_res, entity="object")
+
+        created_tags: list[dict[str, str]] = []
+        for index, tag_plan in enumerate(model["tags"]):
+            tag_body = {
+                "parentId": object_id,
+                "attributes": copy.deepcopy(tag_plan["tag"]["attributes"]),
+            }
+            tag_res = self._api_request("POST", "/tags/", tag_body)
+            tag_id = self._response_id(tag_res, entity=f"tag[{index}]")
+            created_tags.append({"property": tag_plan["property"], "tagId": tag_id})
+
+        linked_tags = []
+        for tag_plan, created in zip(model["tags"], created_tags, strict=True):
+            linked_tags.append(
+                {
+                    "tagId": created["tagId"],
+                    "attributes": copy.deepcopy(tag_plan["link"]["attributes"]),
+                }
+            )
+
+        if linked_tags:
+            self._api_request(
+                "PUT",
+                "/connectors/",
+                {
+                    "id": self._config_from_file.id,
+                    "linkedTags": linked_tags,
+                },
+            )
+
+        return {
+            "objectId": object_id,
+            "tags": created_tags,
+        }
+
+    def _api_base_url(self) -> str:
+        auto_cfg = self._auto_create_config()
+        base_url = auto_cfg.get("apiUrl") or auto_cfg.get("api_url") or auto_cfg.get("platformUrl")
+        if not base_url:
+            raise RuntimeError("Для REST autoCreate необходимо указать autoCreate.apiUrl.")
+        return str(base_url).rstrip("/") + "/"
+
+    def _api_request(self, method: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        auto_cfg = self._auto_create_config()
+        url = urljoin(self._api_base_url(), path.lstrip("/"))
+        raw_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            **_as_dict(auto_cfg.get("apiHeaders") or auto_cfg.get("api_headers")),
+        }
+        token = auto_cfg.get("apiToken") or auto_cfg.get("api_token") or auto_cfg.get("token")
+        if token and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {token}"
+
+        timeout = float(auto_cfg.get("apiTimeout") or auto_cfg.get("api_timeout") or 15)
+        request = Request(url=url, data=raw_body, headers=headers, method=method.upper())
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                response_body = response.read().decode("utf-8")
+        except HTTPError as ex:
+            try:
+                error_body = ex.read().decode("utf-8")
+            except Exception:
+                error_body = str(ex)
+            raise RuntimeError(f"HTTP {ex.code} {method} {url}: {error_body}") from ex
+        except URLError as ex:
+            raise RuntimeError(f"Ошибка подключения к {url}: {ex}") from ex
+
+        if not response_body:
+            return {}
+        try:
+            return json.loads(response_body)
+        except json.JSONDecodeError as ex:
+            raise RuntimeError(f"Некорректный JSON в ответе {method} {url}: {response_body}") from ex
+
+    @staticmethod
+    def _response_id(response: dict[str, Any], entity: str) -> str:
+        value = response.get("id")
+        if not value and isinstance(response.get("data"), dict):
+            value = response["data"].get("id")
+        if not value:
+            raise RuntimeError(f"REST API не вернул id для {entity}: {response}")
+        return str(value)
 
 
 def main_entry() -> None:

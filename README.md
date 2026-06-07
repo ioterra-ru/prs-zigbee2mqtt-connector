@@ -42,6 +42,7 @@ prs-zigbee2mqtt-connector --config config.json
     "base_topic": "zigbee2mqtt",
     "autoCreate": {
       "enabled": true,
+      "mode": "event",
       "parentId": "uuid-родительского-объекта",
       "objectCnTemplate": "{friendly_name}",
       "tagCnTemplate": "{device}_{property}",
@@ -57,7 +58,9 @@ prs-zigbee2mqtt-connector --config config.json
       "tagAttributes": {
         "prsActive": true
       },
-      "linkAttributes": {}
+      "linkAttributes": {},
+      "apiUrl": "https://peresvet.example/v1",
+      "apiToken": "token"
     }
   },
   "log": {
@@ -71,6 +74,7 @@ prs-zigbee2mqtt-connector --config config.json
 | Поле | Описание |
 | --- | --- |
 | `enabled` | Включает публикацию discovery-событий. По умолчанию выключено. |
+| `mode` | `event` — отправить MQTT-событие для обработчика платформы; `rest` — самому вызвать HTTP API Пересвета. Если указан `apiUrl`, по умолчанию используется `rest`. |
 | `parentId` | Родительский объект в модели Пересвет, под которым нужно создать объект устройства. |
 | `objectCnTemplate` | Шаблон имени объекта. Доступны `{friendly_name}`, `{ieee_address}`, `{model}`, `{vendor}`. |
 | `tagCnTemplate` | Шаблон имени тегов. Доступны `{device}`, `{friendly_name}`, `{ieee_address}`, `{property}`, `{name}`. |
@@ -80,8 +84,15 @@ prs-zigbee2mqtt-connector --config config.json
 | `objectAttributes` | Дополнительные атрибуты создаваемого объекта. |
 | `tagAttributes` | Дополнительные атрибуты создаваемых тегов. |
 | `linkAttributes` | Дополнительные атрибуты привязки тегов к коннектору. |
+| `apiUrl` | Базовый URL API Пересвета для `mode=rest`, например `https://host/v1`. |
+| `apiToken` | Bearer-токен для REST API. Вместо него можно задать `apiHeaders`. |
+| `apiHeaders` | Дополнительные HTTP-заголовки для REST API. |
+| `fallbackToEvent` | Если `true`, при ошибке REST-запросов коннектор отправит MQTT discovery-событие. |
 
-Коннектор публикует discovery-событие в `conn2prs/<connector_id>`:
+### Режим `event`
+
+В режиме `event` коннектор публикует discovery-событие в
+`conn2prs/<connector_id>`:
 
 ```json
 {
@@ -138,6 +149,19 @@ prs-zigbee2mqtt-connector --config config.json
 Обработчик на стороне платформы должен принять это действие, создать объект,
 создать теги под ним и привязать теги к коннектору с указанным
 `prsJsonConfigString`. Сам базовый класс `prs-connector-core` не меняется.
+
+### Режим `rest`
+
+В режиме `rest` коннектор сам выполняет HTTP-запросы к API Пересвета:
+
+1. `POST /v1/objects/` — создаёт объект устройства под `parentId`;
+2. `POST /v1/tags/` — создаёт теги под созданным объектом;
+3. `PUT /v1/connectors/` — привязывает созданные теги к текущему коннектору.
+
+После успешного создания коннектор публикует служебное событие
+`prsConnector.zigbee2mqtt.device_created` в `conn2prs/<connector_id>` с
+идентификаторами созданного объекта и тегов. Это событие нужно только для аудита:
+модель уже создана через REST API.
 
 ## Привязка существующих тегов
 

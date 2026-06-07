@@ -6,6 +6,7 @@ import pytest
 
 from prs_zigbee2mqtt_connector.connector import (
     DISCOVERY_ACTION,
+    DISCOVERY_CREATED_ACTION,
     Zigbee2MqttConnector,
     _flatten_exposes,
     _jsonata_property,
@@ -181,3 +182,56 @@ async def test_subscribe_client_adds_bridge_and_configured_device_topics():
         "z2m/sensor_1",
         "z2m/sensor_2",
     }
+
+
+@pytest.mark.asyncio
+async def test_rest_auto_create_creates_object_tags_and_connector_links():
+    conn = make_connector(
+        {
+            "autoCreate": {
+                "enabled": True,
+                "mode": "rest",
+                "apiUrl": "http://peresvet.local/v1",
+                "parentId": "22222222-2222-2222-2222-222222222222",
+            }
+        }
+    )
+    calls = []
+
+    def fake_api_request(method, path, body):
+        calls.append((method, path, body))
+        if path == "/objects/":
+            return {"id": "object-id"}
+        if path == "/tags/":
+            return {"id": f"tag-id-{len([c for c in calls if c[1] == '/tags/'])}"}
+        return {}
+
+    conn._api_request = fake_api_request
+    device = {
+        "friendly_name": "sensor",
+        "ieee_address": "0x00158d0000000002",
+        "definition": {
+            "exposes": [
+                {"type": "numeric", "property": "temperature", "access": 1},
+                {"type": "numeric", "property": "humidity", "access": 1},
+            ]
+        },
+    }
+
+    await conn._handle_bridge_devices([device])
+
+    assert [call[0:2] for call in calls] == [
+        ("POST", "/objects/"),
+        ("POST", "/tags/"),
+        ("POST", "/tags/"),
+        ("PUT", "/connectors/"),
+    ]
+    assert calls[0][2]["parentId"] == "22222222-2222-2222-2222-222222222222"
+    assert calls[1][2]["parentId"] == "object-id"
+    assert calls[3][2]["id"] == "11111111-1111-1111-1111-111111111111"
+    assert [item["tagId"] for item in calls[3][2]["linkedTags"]] == ["tag-id-1", "tag-id-2"]
+
+    assert len(conn._mqtt_client.publishes) == 1
+    created_payload = json.loads(conn._mqtt_client.publishes[0]["payload"])
+    assert created_payload["action"] == DISCOVERY_CREATED_ACTION
+    assert created_payload["data"]["result"]["objectId"] == "object-id"
